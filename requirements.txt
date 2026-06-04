@@ -1,0 +1,11 @@
+python-docx
+chromadb
+sentence-transformers
+langchain
+langchain-community
+transformers
+torch
+numpy
+pandas
+tqdm
+unidecode

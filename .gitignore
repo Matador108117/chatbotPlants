@@ -1,0 +1,7 @@
+documents/
+chroma_db/
+.env/
+data/
+json/
+plants.json
+__pycache__/
