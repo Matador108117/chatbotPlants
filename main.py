@@ -1,25 +1,58 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-from rag_chat import (
-    retrieve_context,
-    build_prompt,
-    ask_llm,
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+ 
+from rag_chat import run_pipeline
+ 
+app = FastAPI(
+    title="Aloe - Chatbot Botánico",
+    description="RAG híbrido sobre plantas medicinales y tóxicas.",
+    version="1.0.0",
 )
-
-app = FastAPI()
-
-
+ 
+ 
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    question: str
-
-
-@app.post("/chat")
-def chat(request: ChatRequest):
-    plants, context = retrieve_context(request.question)
-
-    prompt = build_prompt(request.question, plants, context)
-
-    answer = ask_llm(prompt)
-
-    return {"answer": answer}
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Pregunta del usuario sobre plantas.",
+    )
+ 
+ 
+class ChatResponse(BaseModel):
+    answer: str = Field(description="Respuesta en lenguaje natural de Aloe.")
+    plants_found: list[str] = Field(description="Nombres de plantas detectadas en la pregunta.")
+    intent: str = Field(description="Intención detectada (toxicity, scientific, comparison, etc.).")
+    context_used: bool = Field(description="Indica si se encontró contexto en Chroma.")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/health")
+def health() -> dict:
+    """Endpoint de salud para Docker healthcheck."""
+    return {"status": "ok"}
+ 
+ 
+@app.post("/chat", response_model=ChatResponse)
+def chat(request: ChatRequest) -> ChatResponse:
+    """
+    Recibe una pregunta y devuelve la respuesta de Aloe
+    junto con metadatos de diagnóstico.
+    """
+    try:
+        result = run_pipeline(request.question)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno del pipeline: {exc}",
+        )
+ 
+    return ChatResponse(**result)
+ 

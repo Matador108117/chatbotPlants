@@ -1,7 +1,8 @@
 documents/
 chroma_db/
-.env/
+.envModel/
 data/
 json/
 plants.json
 __pycache__/
+.env
