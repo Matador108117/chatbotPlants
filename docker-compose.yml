@@ -1,39 +1,11 @@
-version: "3.9"
-
 services:
-
-  ollama:
-
-    image: ollama/ollama
-
-    container_name: ollama
-
-    ports:
-      - "11434:11434"
-
-    volumes:
-      - ollama:/root/.ollama
-
-    restart: unless-stopped
-
-  floramind:
-
+  aloe-api:
     build: .
-
-    container_name: floramind
-
     ports:
-      - "8000:8000"
-
+      - "7860:7860"
     volumes:
-      - ./data:/app/data
-      - ./chroma_db:/app/chroma_db
-
-    depends_on:
-      - ollama
-
+      - ./plants.json:/app/plants.json:ro
+      - ./chroma_db:/app/chroma_db:ro
+    env_file:
+      - .env
     restart: unless-stopped
-
-volumes:
-
-  ollama:

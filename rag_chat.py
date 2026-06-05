@@ -1,28 +1,44 @@
 import json
-import requests
+import os
+import re
 import chromadb
+from dotenv import load_dotenv
 
+load_dotenv()
+
+from groq import Groq
 from sentence_transformers import SentenceTransformer
 from structured_search import PlantStructuredSearch
 from intent_detector import detect_intent
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "qwen2.5:3b"
-CHROMA_PATH = "./chroma_db"
-PLANTS_JSON = "plants.json"
+# ---------------------------------------------------------------------------
+# Configuración — sobreescribible por variables de entorno
+# ---------------------------------------------------------------------------
+GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "llama-3.1-8b-instant")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")   # requerido
+CHROMA_PATH  = os.environ.get("CHROMA_PATH",  "./chroma_db")
+PLANTS_JSON  = os.environ.get("PLANTS_JSON",  "plants.json")
 COLLECTION_NAME = "plants"
+
+if not GROQ_API_KEY:
+    raise EnvironmentError(
+        "Falta la variable de entorno GROQ_API_KEY. "
+        "Agrégala en tu .env o en los secretos del deployment."
+    )
 
 # ---------------------------------------------------------------------------
 # Inicialización (una sola vez al importar)
 # ---------------------------------------------------------------------------
+groq_client     = Groq(api_key=GROQ_API_KEY)
 embedding_model = SentenceTransformer("intfloat/multilingual-e5-small")
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection = chroma_client.get_collection(COLLECTION_NAME)
-structured = PlantStructuredSearch(PLANTS_JSON)
+chroma_client   = chromadb.PersistentClient(path=CHROMA_PATH)
+collection      = chroma_client.get_collection(COLLECTION_NAME)
+structured      = PlantStructuredSearch(PLANTS_JSON)
 
 
 # ---------------------------------------------------------------------------
 # Recuperación de contexto híbrido JSON + Chroma
+# (sin cambios — los embeddings locales siguen funcionando igual)
 # ---------------------------------------------------------------------------
 def retrieve_context(question: str) -> tuple[list[dict], str]:
     plants = structured.find_plants(question)
@@ -63,55 +79,75 @@ def retrieve_context(question: str) -> tuple[list[dict], str]:
 
 
 # ---------------------------------------------------------------------------
-# Sistema de prompt: identidad Aloe + primera persona + anti-alucinación
+# Identidad de Aloe — ahora va en el rol "system" de la API de Groq
+# Esto es clave: Groq/OpenAI-compatible APIs distinguen system vs user,
+# lo que hace que el modelo respete la identidad de forma mucho más
+# consistente que embebiendo todo en un único bloque de texto.
 # ---------------------------------------------------------------------------
-
-# Prompt de sistema fijo — define la identidad de Aloe de forma autoritaria.
-# Qwen respeta un bloque de sistema explícito y separado de la instrucción.
-_SYSTEM_IDENTITY = """Eres Aloe. Eres una asistente botánica especializada en plantas medicinales, comestibles y tóxicas.
-
+_SYSTEM_IDENTITY = """\
+Tu nombre es Aloe.
+IMPORTANTE:
+- Siempre hablas como Aloe.
+- Nunca digas "soy botánica".
+- Nunca digas "como botánica".
+- Nunca digas "soy experta".
+- Nunca digas "como experta".
+- Nunca digas "como profesional de la salud".
+- Nunca adoptes una identidad humana.
 Tu forma de hablar:
-- Hablas siempre en PRIMERA PERSONA. Nunca digas "el asistente" ni "según la información". Di "yo sé", "en mi base de datos tengo", "lo que conozco de esta planta es…"
-- Tu tono es cálido, directo y experto. Como una botánica de confianza, no como un manual.
+- Hablas siempre desde la perpectiva de Aole. Nunca digas "el asistente" ni "según la información". \
+-Dilo como si fuera tu conocimiento directo, en primera persona.\
+- No menciones tu especializacion o grado ni el hecho de que eres un modelo de lenguaje,
+- Tu tono es cálido, directo y didactico, con un toque familiar o amigable.
 - Cuando sí tienes datos: comparte todo lo que sabes con detalle y naturalidad.
-- Cuando NO tienes datos de una planta: lo dices honestamente en primera persona. Ejemplo: "Honestamente, esa planta no está en mi base de datos. No tengo información sobre ella y prefiero no inventar nada."
-- NUNCA inventes nombres científicos, familias, usos ni propiedades que no estén en los DATOS ESTRUCTURADOS o el CONTEXTO. Si no está ahí, no lo sabes.
-- No menciones que tienes un "contexto recuperado" ni "datos estructurados". Eso es interno. Habla como si el conocimiento fuera tuyo."""
+- Cuando NO tienes datos de una planta: lo dices honestamente en primera persona. \
+Ejemplo: "Honestamente, esa planta no está en mi conocimiento. Prefiero no inventar nada."
+- NUNCA inventes nombres científicos, familias, usos ni propiedades que no estén \
+en los DATOS o el CONTEXTO que se te proporciona. Si no está ahí, no lo sabes.
+- No menciones términos como "contexto recuperado", "datos estructurados" ni "base de datos". \
+Eso es interno. Habla como si el conocimiento fuera tuyo.\
+"""
 
 
-def build_prompt(
+def build_messages(
     question: str,
     plants: list[dict],
     context: str,
     intent: str,
-) -> str:
+) -> list[dict]:
+    """
+    Construye la lista de mensajes en formato OpenAI/Groq:
+      [ {"role": "system", ...}, {"role": "user", ...} ]
+
+    El system prompt lleva la identidad de Aloe.
+    El user message lleva los datos + la pregunta real.
+    Esta separación es la que hace que el modelo mantenga
+    la identidad de forma consistente.
+    """
     structured_block = ""
     for plant in plants:
         structured_block += json.dumps(plant, ensure_ascii=False, indent=2) + "\n\n"
     structured_block = structured_block.strip()
 
     intent_instruction = _intent_instruction(intent, plants)
-
     has_data = bool(structured_block or context)
     context_block = context if context else "Sin contexto disponible."
 
-    # Aviso explícito de vacío para que Aloe no alucine
     data_warning = (
         ""
         if has_data
-        else "\n⚠️ ADVERTENCIA: No hay datos sobre esta planta en tu base de conocimiento. "
-             "Debes decirle al usuario honestamente que no tienes información sobre ella. "
-             "No inventes nada.\n"
+        else (
+            "\n⚠️ ADVERTENCIA: No hay datos sobre esta planta en tu conocimiento. "
+            "Debes decirle al usuario honestamente que no tienes información sobre ella. "
+            "No inventes nada.\n"
+        )
     )
 
-    return f"""{_SYSTEM_IDENTITY}
-
----
-
+    user_content = f"""\
 INSTRUCCIÓN PARA ESTA RESPUESTA:
 {intent_instruction}
 {data_warning}
-DATOS QUE CONOCES (usa estos como fuente principal):
+DATOS QUE CONOCES (fuente principal):
 {structured_block if structured_block else "— ninguno para esta consulta —"}
 
 CONTEXTO ADICIONAL (complementa si aporta algo nuevo):
@@ -122,9 +158,14 @@ PREGUNTA DEL USUARIO:
 
 TU RESPUESTA (en primera persona, en español):"""
 
+    return [
+        {"role": "system",  "content": _SYSTEM_IDENTITY},
+        {"role": "user",    "content": user_content},
+    ]
+
 
 def _intent_instruction(intent: str, plants: list[dict]) -> str:
-    names = [p["nombre"] for p in plants]
+    names   = [p["nombre"] for p in plants]
     listing = " y ".join(names) if names else "la planta que menciona el usuario"
 
     instructions: dict[str, str] = {
@@ -172,39 +213,39 @@ def _intent_instruction(intent: str, plants: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Llamada a Ollama con manejo de errores
+# Llamada a Groq
 # ---------------------------------------------------------------------------
-def ask_llm(prompt: str) -> str:
+
+# Patrón para eliminar bloques <think>...</think> que escape al filtro de la API.
+# Cubre variantes multilinea y espacios irregulares.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    """Elimina cualquier bloque <think>...</think> y normaliza espacios."""
+    return _THINK_RE.sub("", text).strip()
+
+
+def ask_llm(messages: list[dict]) -> str:
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL_NAME,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=300,
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=1024,
+            # Desactiva el thinking mode de Qwen3 a nivel de API.
+            # Groq expone este parámetro como extra_body para modelos compatibles.
         )
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            "No pude conectarme a Ollama. "
-            "Verifica que el servicio esté corriendo en localhost:11434."
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            "Ollama tardó demasiado en responder (timeout 300s)."
-        )
+    except Exception as exc:
+        raise RuntimeError(f"Error al llamar a Groq: {exc}") from exc
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Ollama respondió con error {response.status_code}: {response.text}"
-        )
+    raw = response.choices[0].message.content or ""
 
-    data = response.json()
-    answer = data.get("response", "").strip()
+    # Red de seguridad: elimina <think> aunque la API lo filtre parcialmente
+    answer = _strip_thinking(raw)
 
     if not answer:
-        raise RuntimeError("Ollama devolvió una respuesta vacía.")
+        raise RuntimeError("Groq devolvió una respuesta vacía.")
 
     return answer
 
@@ -214,13 +255,13 @@ def ask_llm(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 def run_pipeline(question: str) -> dict:
     plants, context = retrieve_context(question)
-    intent = detect_intent(question)
-    prompt = build_prompt(question, plants, context, intent)
-    answer = ask_llm(prompt)
+    intent          = detect_intent(question)
+    messages        = build_messages(question, plants, context, intent)
+    answer          = ask_llm(messages)
 
     return {
-        "answer": answer,
+        "answer":       answer,
         "plants_found": [p["nombre"] for p in plants],
-        "intent": intent,
+        "intent":       intent,
         "context_used": bool(context),
     }
